@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">Prism 3D</string>
+    <string name="cd_toggle_hud">Toggle studio HUD</string>
+    <string name="cd_reset_camera">Reset camera view</string>
+    <string name="cd_toggle_autoplay">Toggle auto rotation</string>
+    <string name="cd_open_inspector">Open scene inspector</string>
+    <string name="cd_close_inspector">Close scene inspector</string>
+    <string name="cd_camera_preset">Select camera angle</string>
+    <string name="cd_scene_preset">Select 3D scene</string>
+    <string name="engine_loading">Initializing WebGL Engine…</string>
+    <string name="engine_retry">Retry Three.js CDN</string>
+</resources>

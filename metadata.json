@@ -1,0 +1,6 @@
+{
+  "name": "Prism 3D",
+  "description": "Interactive Three.js 3D viewport and shader studio for Android with real-time primitives, PBR materials, lighting presets, and touch orbit controls.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

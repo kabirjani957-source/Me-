@@ -1,0 +1,961 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Prism 3D Viewport</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #07090F;
+      touch-action: none;
+      user-select: none;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      touch-action: none;
+    }
+  </style>
+</head>
+<body>
+<canvas id="gl-canvas"></canvas>
+
+<script>
+(function () {
+  const canvas = document.getElementById('gl-canvas');
+  const bridge = window.AndroidBridge || null;
+
+  let currentConfig = {
+    scene: 'torus_knot',
+    materialMode: 'physical',
+    lightingPreset: 'cyber',
+    primaryColorHex: '#38BDF8',
+    metalness: 0.72,
+    roughness: 0.18,
+    distortion: 0.35,
+    animSpeed: 1.0,
+    autoRotate: true,
+    showGrid: true,
+    showParticles: true
+  };
+
+  let engineMode = 'loading';
+  let activeApi = null;
+
+  function notifyReady(name, isFallback) {
+    if (bridge && bridge.onEngineReady) {
+      bridge.onEngineReady(name, !!isFallback);
+    }
+  }
+
+  function notifyTelemetry(data) {
+    if (bridge && bridge.onTelemetry) {
+      bridge.onTelemetry(JSON.stringify(data));
+    }
+  }
+
+  window.applyConfig = function (jsonOrObj) {
+    try {
+      const next = typeof jsonOrObj === 'string' ? JSON.parse(jsonOrObj) : jsonOrObj;
+      const prevScene = currentConfig.scene;
+      const prevMat = currentConfig.materialMode;
+      const prevLight = currentConfig.lightingPreset;
+      const prevColor = currentConfig.primaryColorHex;
+      currentConfig = Object.assign({}, currentConfig, next);
+      if (activeApi) {
+        activeApi.onConfigUpdated(prevScene, prevMat, prevLight, prevColor);
+      }
+    } catch (e) {
+      console.error('applyConfig error', e);
+    }
+  };
+
+  window.setCameraView = function (viewId) {
+    if (activeApi && activeApi.setCameraView) {
+      activeApi.setCameraView(viewId);
+    }
+  };
+
+  window.resetCamera = function () {
+    if (activeApi && activeApi.setCameraView) {
+      activeApi.setCameraView('perspective');
+    }
+  };
+
+  // Load Three.js with multi-CDN fallback, then fallback to native WebGL2 if offline
+  const cdnList = [
+    'https://cdn.jsdelivr.net/npm/three@0.147.0/build/three.min.js',
+    'https://unpkg.com/three@0.147.0/build/three.min.js',
+    'https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js'
+  ];
+
+  function loadScriptAt(index) {
+    if (window.THREE) {
+      initThreeEngine();
+      return;
+    }
+    if (index >= cdnList.length) {
+      initWebGL2Fallback();
+      return;
+    }
+    const s = document.createElement('script');
+    s.src = cdnList[index];
+    s.async = true;
+    const timeout = setTimeout(() => {
+      if (!window.THREE) {
+        s.onerror = null;
+        loadScriptAt(index + 1);
+      }
+    }, 5500);
+    s.onload = () => {
+      clearTimeout(timeout);
+      if (window.THREE) {
+        initThreeEngine();
+      } else {
+        loadScriptAt(index + 1);
+      }
+    };
+    s.onerror = () => {
+      clearTimeout(timeout);
+      loadScriptAt(index + 1);
+    };
+    document.head.appendChild(s);
+  }
+
+  // Shared touch spherical camera state
+  function createTouchController(domElement, onDoubleTap) {
+    const state = {
+      theta: 0.62,
+      phi: 1.15,
+      radius: 5.4,
+      targetTheta: 0.62,
+      targetPhi: 1.15,
+      targetRadius: 5.4,
+      panX: 0,
+      panY: 0,
+      targetPanX: 0,
+      targetPanY: 0,
+      isDragging: false,
+      lastTapTime: 0
+    };
+
+    const pointers = new Map();
+    let prevMidX = 0;
+    let prevMidY = 0;
+    let prevDist = 0;
+
+    domElement.addEventListener('pointerdown', (e) => {
+      domElement.setPointerCapture(e.pointerId);
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      state.isDragging = true;
+
+      if (pointers.size === 1) {
+        const now = performance.now();
+        if (now - state.lastTapTime < 280) {
+          onDoubleTap();
+          state.lastTapTime = 0;
+        } else {
+          state.lastTapTime = now;
+        }
+      } else if (pointers.size === 2) {
+        const pts = Array.from(pointers.values());
+        prevMidX = (pts[0].x + pts[1].x) * 0.5;
+        prevMidY = (pts[0].y + pts[1].y) * 0.5;
+        prevDist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+      }
+    });
+
+    domElement.addEventListener('pointermove', (e) => {
+      if (!pointers.has(e.pointerId)) return;
+      const prev = pointers.get(e.pointerId);
+      const dx = e.clientX - prev.x;
+      const dy = e.clientY - prev.y;
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+      if (pointers.size === 1) {
+        state.targetTheta -= dx * 0.0085;
+        state.targetPhi = Math.max(0.18, Math.min(Math.PI - 0.18, state.targetPhi - dy * 0.0075));
+      } else if (pointers.size === 2) {
+        const pts = Array.from(pointers.values());
+        const midX = (pts[0].x + pts[1].x) * 0.5;
+        const midY = (pts[0].y + pts[1].y) * 0.5;
+        const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+        if (prevDist > 10) {
+          const scale = prevDist / Math.max(10, dist);
+          state.targetRadius = Math.max(2.3, Math.min(15.0, state.targetRadius * scale));
+        }
+        state.targetPanX = Math.max(-2.5, Math.min(2.5, state.targetPanX - (midX - prevMidX) * 0.0045));
+        state.targetPanY = Math.max(-2.5, Math.min(2.5, state.targetPanY + (midY - prevMidY) * 0.0045));
+        prevMidX = midX;
+        prevMidY = midY;
+        prevDist = dist;
+      }
+    });
+
+    function removePointer(e) {
+      pointers.delete(e.pointerId);
+      if (pointers.size < 2) prevDist = 0;
+      if (pointers.size === 0) state.isDragging = false;
+    }
+
+    domElement.addEventListener('pointerup', removePointer);
+    domElement.addEventListener('pointercancel', removePointer);
+    domElement.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      state.targetRadius = Math.max(2.3, Math.min(15.0, state.targetRadius + e.deltaY * 0.004));
+    }, { passive: false });
+
+    return state;
+  }
+
+  // ============================================================================
+  // PRIMARY ENGINE: THREE.JS
+  // ============================================================================
+  function initThreeEngine() {
+    engineMode = 'threejs';
+    const THREE = window.THREE;
+
+    let renderer;
+    try {
+      renderer = new THREE.WebGLRenderer({
+        canvas: canvas,
+        antialias: true,
+        powerPreference: 'high-performance',
+        alpha: false
+      });
+    } catch (err) {
+      initWebGL2Fallback();
+      return;
+    }
+
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputEncoding = THREE.sRGBEncoding;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.18;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x07090F);
+    scene.fog = new THREE.FogExp2(0x07090F, 0.045);
+
+    const camera = new THREE.PerspectiveCamera(46, window.innerWidth / window.innerHeight, 0.1, 100);
+
+    // Procedural studio environment map for realistic PBR reflections
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    const envScene = new THREE.Scene();
+    envScene.background = new THREE.Color(0x0B101E);
+    const envLight1 = new THREE.Mesh(
+      new THREE.PlaneGeometry(14, 6),
+      new THREE.MeshBasicMaterial({ color: 0x38BDF8, side: THREE.DoubleSide })
+    );
+    envLight1.position.set(6, 5, 4);
+    envLight1.lookAt(0, 0, 0);
+    envScene.add(envLight1);
+
+    const envLight2 = new THREE.Mesh(
+      new THREE.PlaneGeometry(12, 5),
+      new THREE.MeshBasicMaterial({ color: 0xF59E0B, side: THREE.DoubleSide })
+    );
+    envLight2.position.set(-7, 2, -5);
+    envLight2.lookAt(0, 0, 0);
+    envScene.add(envLight2);
+
+    const envLight3 = new THREE.Mesh(
+      new THREE.PlaneGeometry(16, 16),
+      new THREE.MeshBasicMaterial({ color: 0xA78BFA, side: THREE.DoubleSide })
+    );
+    envLight3.position.set(0, 10, 0);
+    envLight3.lookAt(0, 0, 0);
+    envScene.add(envLight3);
+
+    const envRT = pmrem.fromScene(envScene, 0.04);
+    scene.environment = envRT.texture;
+    pmrem.dispose();
+
+    // Lighting rig
+    const ambientLight = new THREE.AmbientLight(0x8FA4C8, 0.45);
+    scene.add(ambientLight);
+
+    const hemiLight = new THREE.HemisphereLight(0x7DD3FC, 0x101521, 0.75);
+    scene.add(hemiLight);
+
+    const keyLight = new THREE.DirectionalLight(0xFFFFFF, 2.2);
+    keyLight.position.set(5, 7, 5);
+    scene.add(keyLight);
+
+    const rimLight = new THREE.DirectionalLight(0x38BDF8, 1.8);
+    rimLight.position.set(-6, 3, -5);
+    scene.add(rimLight);
+
+    const accentPoint = new THREE.PointLight(0xF59E0B, 2.2, 16);
+    accentPoint.position.set(3, -1.2, 3);
+    scene.add(accentPoint);
+
+    // Floor Grid & Polar Ring
+    const gridGroup = new THREE.Group();
+    const gridHelper = new THREE.GridHelper(18, 28, 0x263450, 0x131B2C);
+    gridHelper.position.y = -2.15;
+    gridGroup.add(gridHelper);
+
+    const ringGeo = new THREE.RingGeometry(2.15, 2.18, 96);
+    ringGeo.rotateX(-Math.PI / 2);
+    const ringMat = new THREE.MeshBasicMaterial({ color: 0x38BDF8, transparent: true, opacity: 0.35, side: THREE.DoubleSide });
+    const floorRing = new THREE.Mesh(ringGeo, ringMat);
+    floorRing.position.y = -2.14;
+    gridGroup.add(floorRing);
+    scene.add(gridGroup);
+
+    // Star/Dust Particle Field
+    const particleCount = 720;
+    const pPositions = new Float32Array(particleCount * 3);
+    for (let i = 0; i < particleCount; i++) {
+      const r = 4.5 + Math.random() * 14.0;
+      const a = Math.random() * Math.PI * 2;
+      const b = Math.acos(2 * Math.random() - 1);
+      pPositions[i * 3] = r * Math.sin(b) * Math.cos(a);
+      pPositions[i * 3 + 1] = r * Math.cos(b) * 0.75;
+      pPositions[i * 3 + 2] = r * Math.sin(b) * Math.sin(a);
+    }
+    const particleGeo = new THREE.BufferGeometry();
+    particleGeo.setAttribute('position', new THREE.BufferAttribute(pPositions, 3));
+    const particleMat = new THREE.PointsMaterial({
+      color: 0x7DD3FC,
+      size: 0.055,
+      transparent: true,
+      opacity: 0.65,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
+    });
+    const particleField = new THREE.Points(particleGeo, particleMat);
+    scene.add(particleField);
+
+    // Hologram Custom Shader Material
+    const hologramUniforms = {
+      uTime: { value: 0 },
+      uColor: { value: new THREE.Color(currentConfig.primaryColorHex) },
+      uDistortion: { value: currentConfig.distortion }
+    };
+    const hologramMaterial = new THREE.ShaderMaterial({
+      uniforms: hologramUniforms,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide,
+      vertexShader: `
+        varying vec3 vNormalWorld;
+        varying vec3 vViewDir;
+        varying vec3 vLocalPos;
+        uniform float uTime;
+        uniform float uDistortion;
+        void main() {
+          vLocalPos = position;
+          vec3 displaced = position + normal * sin(position.y * 5.0 + uTime * 3.0) * (0.04 * uDistortion);
+          vec4 worldPos = modelMatrix * vec4(displaced, 1.0);
+          vNormalWorld = normalize(mat3(modelMatrix) * normal);
+          vViewDir = normalize(cameraPosition - worldPos.xyz);
+          gl_Position = projectionMatrix * viewMatrix * worldPos;
+        }
+      `,
+      fragmentShader: `
+        varying vec3 vNormalWorld;
+        varying vec3 vViewDir;
+        varying vec3 vLocalPos;
+        uniform float uTime;
+        uniform vec3 uColor;
+        void main() {
+          float fresnel = pow(1.0 - abs(dot(normalize(vNormalWorld), normalize(vViewDir))), 2.2);
+          float scan = 0.55 + 0.45 * sin(vLocalPos.y * 26.0 - uTime * 4.5);
+          float alpha = clamp(fresnel * 0.95 + 0.16 * scan, 0.08, 0.92);
+          vec3 col = uColor * (0.7 + 1.2 * fresnel) * (0.8 + 0.25 * scan);
+          gl_FragColor = vec4(col, alpha);
+        }
+      `
+    });
+
+    function createActiveMaterial() {
+      const col = new THREE.Color(currentConfig.primaryColorHex);
+      switch (currentConfig.materialMode) {
+        case 'hologram':
+          hologramUniforms.uColor.value.copy(col);
+          return hologramMaterial;
+        case 'wireframe':
+          return new THREE.MeshBasicMaterial({
+            color: col,
+            wireframe: true,
+            transparent: true,
+            opacity: 0.92
+          });
+        case 'clay':
+          return new THREE.MeshStandardMaterial({
+            color: col.clone().lerp(new THREE.Color(0xE2E8F0), 0.35),
+            roughness: 0.88,
+            metalness: 0.05
+          });
+        case 'physical':
+        default:
+          return new THREE.MeshPhysicalMaterial({
+            color: col,
+            metalness: currentConfig.metalness,
+            roughness: currentConfig.roughness,
+            clearcoat: 1.0,
+            clearcoatRoughness: 0.1,
+            envMapIntensity: 1.4
+          });
+      }
+    }
+
+    // Main Scene Subject Group
+    const subjectGroup = new THREE.Group();
+    scene.add(subjectGroup);
+
+    let mainMesh = null;
+    let secondaryMeshes = [];
+    let basePositions = null;
+    let orreryBodies = [];
+
+    function clearSubject() {
+      while (subjectGroup.children.length > 0) {
+        const child = subjectGroup.children[0];
+        subjectGroup.remove(child);
+        if (child.geometry) child.geometry.dispose();
+        if (child.material && child.material !== hologramMaterial && child.material.dispose) {
+          child.material.dispose();
+        }
+      }
+      mainMesh = null;
+      secondaryMeshes = [];
+      basePositions = null;
+      orreryBodies = [];
+    }
+
+    function buildSceneSubject() {
+      clearSubject();
+      const mat = createActiveMaterial();
+      const col = new THREE.Color(currentConfig.primaryColorHex);
+
+      if (currentConfig.scene === 'torus_knot') {
+        const geo = new THREE.TorusKnotGeometry(1.12, 0.34, 220, 40, 2, 3);
+        mainMesh = new THREE.Mesh(geo, mat);
+        subjectGroup.add(mainMesh);
+
+        const haloGeo = new THREE.TorusGeometry(1.95, 0.025, 16, 120);
+        const haloMat = new THREE.MeshBasicMaterial({ color: 0xF59E0B, transparent: true, opacity: 0.65 });
+        const halo = new THREE.Mesh(haloGeo, haloMat);
+        halo.rotation.x = Math.PI * 0.38;
+        subjectGroup.add(halo);
+        secondaryMeshes.push(halo);
+      } else if (currentConfig.scene === 'geodesic_core') {
+        const outerGeo = new THREE.IcosahedronGeometry(1.45, 1);
+        mainMesh = new THREE.Mesh(outerGeo, mat);
+        subjectGroup.add(mainMesh);
+
+        const cageGeo = new THREE.IcosahedronGeometry(1.68, 1);
+        const cageMat = new THREE.MeshBasicMaterial({ color: col, wireframe: true, transparent: true, opacity: 0.45 });
+        const cage = new THREE.Mesh(cageGeo, cageMat);
+        subjectGroup.add(cage);
+        secondaryMeshes.push(cage);
+
+        const innerGeo = new THREE.OctahedronGeometry(0.68, 0);
+        const innerMat = new THREE.MeshStandardMaterial({
+          color: 0xF59E0B,
+          emissive: 0xF59E0B,
+          emissiveIntensity: 0.85,
+          roughness: 0.2,
+          metalness: 0.8
+        });
+        const innerCore = new THREE.Mesh(innerGeo, innerMat);
+        subjectGroup.add(innerCore);
+        secondaryMeshes.push(innerCore);
+      } else if (currentConfig.scene === 'terrain_wave') {
+        const planeGeo = new THREE.PlaneGeometry(5.6, 5.6, 68, 68);
+        planeGeo.rotateX(-Math.PI / 2);
+        basePositions = new Float32Array(planeGeo.attributes.position.array);
+        if (mat.side !== undefined) mat.side = THREE.DoubleSide;
+        mainMesh = new THREE.Mesh(planeGeo, mat);
+        mainMesh.position.y = -0.35;
+        subjectGroup.add(mainMesh);
+      } else if (currentConfig.scene === 'solar_orrery') {
+        const sunGeo = new THREE.IcosahedronGeometry(0.68, 3);
+        const sunMat = new THREE.MeshStandardMaterial({
+          color: 0xF59E0B,
+          emissive: 0xF59E0B,
+          emissiveIntensity: 1.4,
+          roughness: 0.25
+        });
+        mainMesh = new THREE.Mesh(sunGeo, sunMat);
+        subjectGroup.add(mainMesh);
+
+        const orbits = [
+          { r: 1.35, size: 0.16, speed: 1.35, tilt: 0.12, color: col },
+          { r: 2.05, size: 0.24, speed: 0.82, tilt: -0.24, color: new THREE.Color(0x34D399) },
+          { r: 2.85, size: 0.20, speed: 0.52, tilt: 0.18, color: new THREE.Color(0xA78BFA) }
+        ];
+        orbits.forEach((o, idx) => {
+          const orbitGroup = new THREE.Group();
+          orbitGroup.rotation.z = o.tilt;
+          const trackGeo = new THREE.TorusGeometry(o.r, 0.012, 12, 96);
+          trackGeo.rotateX(Math.PI / 2);
+          const trackMat = new THREE.MeshBasicMaterial({ color: 0x475569, transparent: true, opacity: 0.55 });
+          orbitGroup.add(new THREE.Mesh(trackGeo, trackMat));
+
+          const planetMat = currentConfig.materialMode === 'wireframe'
+            ? new THREE.MeshBasicMaterial({ color: o.color, wireframe: true })
+            : new THREE.MeshPhysicalMaterial({ color: o.color, metalness: currentConfig.metalness, roughness: currentConfig.roughness, clearcoat: 0.9 });
+          const planet = new THREE.Mesh(new THREE.SphereGeometry(o.size, 28, 28), planetMat);
+          orbitGroup.add(planet);
+          subjectGroup.add(orbitGroup);
+          orreryBodies.push({ mesh: planet, radius: o.r, speed: o.speed, phase: idx * 2.1 });
+        });
+      } else if (currentConfig.scene === 'morph_sphere') {
+        const geo = new THREE.IcosahedronGeometry(1.38, 5);
+        basePositions = new Float32Array(geo.attributes.position.array);
+        mainMesh = new THREE.Mesh(geo, mat);
+        subjectGroup.add(mainMesh);
+      }
+
+      if (currentConfig.materialMode === 'wireframe' && mainMesh) {
+        const ptsMat = new THREE.PointsMaterial({
+          color: 0xFFFFFF,
+          size: 0.032,
+          transparent: true,
+          opacity: 0.55
+        });
+        const pts = new THREE.Points(mainMesh.geometry, ptsMat);
+        subjectGroup.add(pts);
+        secondaryMeshes.push(pts);
+      }
+    }
+
+    function applyLightingPreset() {
+      const p = currentConfig.lightingPreset;
+      if (p === 'solar') {
+        scene.background.setHex(0x110B09);
+        scene.fog.color.setHex(0x110B09);
+        keyLight.color.setHex(0xFFE4B5);
+        rimLight.color.setHex(0xF59E0B);
+        accentPoint.color.setHex(0xFB7185);
+        floorRing.material.color.setHex(0xF59E0B);
+        particleMat.color.setHex(0xFCD34D);
+      } else if (p === 'arctic') {
+        scene.background.setHex(0x060D17);
+        scene.fog.color.setHex(0x060D17);
+        keyLight.color.setHex(0xE0F2FE);
+        rimLight.color.setHex(0x38BDF8);
+        accentPoint.color.setHex(0x34D399);
+        floorRing.material.color.setHex(0x7DD3FC);
+        particleMat.color.setHex(0xE0F2FE);
+      } else if (p === 'void') {
+        scene.background.setHex(0x05040A);
+        scene.fog.color.setHex(0x05040A);
+        keyLight.color.setHex(0xDDD6FE);
+        rimLight.color.setHex(0xA78BFA);
+        accentPoint.color.setHex(0x38BDF8);
+        floorRing.material.color.setHex(0xA78BFA);
+        particleMat.color.setHex(0xC4B5FD);
+      } else {
+        scene.background.setHex(0x07090F);
+        scene.fog.color.setHex(0x07090F);
+        keyLight.color.setHex(0xFFFFFF);
+        rimLight.color.setHex(0x38BDF8);
+        accentPoint.color.setHex(0xF59E0B);
+        floorRing.material.color.setHex(0x38BDF8);
+        particleMat.color.setHex(0x7DD3FC);
+      }
+    }
+
+    const touch = createTouchController(canvas, () => {
+      setCameraPreset('perspective');
+    });
+
+    function setCameraPreset(viewId) {
+      touch.targetPanX = 0;
+      touch.targetPanY = 0;
+      if (viewId === 'front') {
+        touch.targetTheta = 0;
+        touch.targetPhi = Math.PI * 0.5;
+        touch.targetRadius = 5.2;
+      } else if (viewId === 'top') {
+        touch.targetTheta = 0;
+        touch.targetPhi = 0.22;
+        touch.targetRadius = 6.2;
+      } else if (viewId === 'iso') {
+        touch.targetTheta = Math.PI * 0.25;
+        touch.targetPhi = 0.95;
+        touch.targetRadius = 5.8;
+      } else {
+        touch.targetTheta = 0.62;
+        touch.targetPhi = 1.15;
+        touch.targetRadius = 5.4;
+      }
+    }
+
+    activeApi = {
+      setCameraView: setCameraPreset,
+      onConfigUpdated: (prevScene, prevMat, prevLight, prevColor) => {
+        gridGroup.visible = !!currentConfig.showGrid;
+        particleField.visible = !!currentConfig.showParticles;
+        if (prevLight !== currentConfig.lightingPreset) {
+          applyLightingPreset();
+        }
+        if (prevScene !== currentConfig.scene || prevMat !== currentConfig.materialMode) {
+          buildSceneSubject();
+        } else if (mainMesh && mainMesh.material) {
+          const mat = mainMesh.material;
+          const col = new THREE.Color(currentConfig.primaryColorHex);
+          if (mat === hologramMaterial) {
+            hologramUniforms.uColor.value.copy(col);
+          } else if (mat.color) {
+            if (currentConfig.materialMode === 'clay') {
+              mat.color.copy(col.clone().lerp(new THREE.Color(0xE2E8F0), 0.35));
+            } else {
+              mat.color.copy(col);
+            }
+          }
+          if (mat.metalness !== undefined && currentConfig.materialMode === 'physical') {
+            mat.metalness = currentConfig.metalness;
+            mat.roughness = currentConfig.roughness;
+          }
+        }
+      }
+    };
+
+    buildSceneSubject();
+    applyLightingPreset();
+    gridGroup.visible = !!currentConfig.showGrid;
+    particleField.visible = !!currentConfig.showParticles;
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    notifyReady('Three.js r147', false);
+
+    let lastTime = performance.now();
+    let elapsed = 0;
+    let frameCount = 0;
+    let lastTelemetryTime = performance.now();
+
+    function animate(now) {
+      requestAnimationFrame(animate);
+      const dt = Math.min(0.05, (now - lastTime) * 0.001);
+      lastTime = now;
+      elapsed += dt * currentConfig.animSpeed;
+
+      // Smooth camera damping
+      if (currentConfig.autoRotate && !touch.isDragging) {
+        touch.targetTheta += dt * 0.32 * currentConfig.animSpeed;
+      }
+      const damp = 1 - Math.exp(-10 * dt);
+      touch.theta += (touch.targetTheta - touch.theta) * damp;
+      touch.phi += (touch.targetPhi - touch.phi) * damp;
+      touch.radius += (touch.targetRadius - touch.radius) * damp;
+      touch.panX += (touch.targetPanX - touch.panX) * damp;
+      touch.panY += (touch.targetPanY - touch.panY) * damp;
+
+      const sinPhi = Math.sin(touch.phi);
+      camera.position.set(
+        touch.panX + touch.radius * sinPhi * Math.sin(touch.theta),
+        touch.panY + touch.radius * Math.cos(touch.phi),
+        touch.radius * sinPhi * Math.cos(touch.theta)
+      );
+      camera.lookAt(touch.panX, touch.panY, 0);
+
+      // Scene procedural animations
+      hologramUniforms.uTime.value = elapsed;
+      hologramUniforms.uDistortion.value = currentConfig.distortion;
+
+      if (currentConfig.scene === 'torus_knot' && mainMesh) {
+        mainMesh.rotation.y = elapsed * 0.25;
+        const pulse = 1 + Math.sin(elapsed * 2.2) * 0.04 * currentConfig.distortion;
+        mainMesh.scale.setScalar(pulse);
+        if (secondaryMeshes[0]) {
+          secondaryMeshes[0].rotation.z = elapsed * 0.4;
+        }
+      } else if (currentConfig.scene === 'geodesic_core' && mainMesh) {
+        mainMesh.rotation.y = elapsed * 0.22;
+        mainMesh.rotation.x = Math.sin(elapsed * 0.5) * 0.15;
+        if (secondaryMeshes[0]) {
+          secondaryMeshes[0].rotation.y = -elapsed * 0.3;
+          secondaryMeshes[0].scale.setScalar(1 + currentConfig.distortion * 0.12);
+        }
+        if (secondaryMeshes[1]) {
+          secondaryMeshes[1].rotation.x = elapsed * 0.8;
+          secondaryMeshes[1].rotation.z = elapsed * 0.6;
+        }
+      } else if (currentConfig.scene === 'terrain_wave' && mainMesh && basePositions) {
+        const pos = mainMesh.geometry.attributes.position;
+        const amp = 0.15 + currentConfig.distortion * 0.72;
+        for (let i = 0; i < pos.count; i++) {
+          const bx = basePositions[i * 3];
+          const bz = basePositions[i * 3 + 2];
+          const dist = Math.sqrt(bx * bx + bz * bz);
+          const y = Math.sin(dist * 2.2 - elapsed * 2.4) * amp * 0.65 +
+                    Math.cos(bx * 1.5 + elapsed * 1.4) * Math.sin(bz * 1.5 - elapsed * 1.1) * amp * 0.45;
+          pos.setY(i, y);
+        }
+        pos.needsUpdate = true;
+        mainMesh.geometry.computeVertexNormals();
+      } else if (currentConfig.scene === 'solar_orrery') {
+        if (mainMesh) {
+          mainMesh.rotation.y = elapsed * 0.35;
+          const s = 1 + Math.sin(elapsed * 3.0) * 0.04 * currentConfig.distortion;
+          mainMesh.scale.setScalar(s);
+        }
+        orreryBodies.forEach((b) => {
+          const ang = elapsed * b.speed + b.phase;
+          b.mesh.position.set(Math.cos(ang) * b.radius, 0, Math.sin(ang) * b.radius);
+          b.mesh.rotation.y = ang;
+        });
+      } else if (currentConfig.scene === 'morph_sphere' && mainMesh && basePositions) {
+        const pos = mainMesh.geometry.attributes.position;
+        const amp = 0.06 + currentConfig.distortion * 0.34;
+        for (let i = 0; i < pos.count; i++) {
+          const bx = basePositions[i * 3];
+          const by = basePositions[i * 3 + 1];
+          const bz = basePositions[i * 3 + 2];
+          const n = Math.sin(bx * 2.8 + elapsed * 2.0) *
+                    Math.cos(by * 2.8 - elapsed * 1.6) *
+                    Math.sin(bz * 2.8 + elapsed * 1.3);
+          const scale = 1 + n * amp;
+          pos.setXYZ(i, bx * scale, by * scale, bz * scale);
+        }
+        pos.needsUpdate = true;
+        mainMesh.geometry.computeVertexNormals();
+      }
+
+      particleField.rotation.y = elapsed * 0.04;
+      renderer.render(scene, camera);
+
+      frameCount++;
+      if (now - lastTelemetryTime >= 420) {
+        const fps = Math.round((frameCount * 1000) / (now - lastTelemetryTime));
+        frameCount = 0;
+        lastTelemetryTime = now;
+        const info = renderer.info.render;
+        const az = Math.round(((touch.theta * 180 / Math.PI) % 360 + 360) % 360);
+        const el = Math.round(90 - touch.phi * 180 / Math.PI);
+        let verts = 0;
+        if (mainMesh && mainMesh.geometry && mainMesh.geometry.attributes.position) {
+          verts = mainMesh.geometry.attributes.position.count;
+        }
+        notifyTelemetry({
+          fps: fps,
+          triangles: info.triangles || 0,
+          vertices: verts,
+          azimuthDeg: az,
+          elevationDeg: el,
+          distance: Number(touch.radius.toFixed(1))
+        });
+      }
+    }
+
+    requestAnimationFrame(animate);
+  }
+
+  // ============================================================================
+  // OFFLINE RESILIENT FALLBACK: NATIVE WEBGL2 3D RENDERER
+  // ============================================================================
+  function initWebGL2Fallback() {
+    engineMode = 'webgl2_fallback';
+    const gl = canvas.getContext('webgl', { antialias: true }) || canvas.getContext('experimental-webgl');
+    if (!gl) {
+      if (bridge && bridge.onEngineError) bridge.onEngineError('WebGL unavailable on this device');
+      return;
+    }
+
+    function resize() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      canvas.width = window.innerWidth * dpr;
+      canvas.height = window.innerHeight * dpr;
+      gl.viewport(0, 0, canvas.width, canvas.height);
+    }
+    resize();
+    window.addEventListener('resize', resize);
+
+    const vsSource = `
+      attribute vec3 aPos;
+      attribute vec3 aNormal;
+      uniform mat4 uMvp;
+      uniform mat4 uModel;
+      varying vec3 vNormal;
+      void main() {
+        vNormal = mat3(uModel) * aNormal;
+        gl_Position = uMvp * vec4(aPos, 1.0);
+      }
+    `;
+    const fsSource = `
+      precision mediump float;
+      varying vec3 vNormal;
+      uniform vec3 uColor;
+      void main() {
+        vec3 n = normalize(vNormal);
+        vec3 lightDir = normalize(vec3(0.6, 0.8, 0.5));
+        float diff = max(dot(n, lightDir), 0.18);
+        float rim = pow(1.0 - max(dot(n, vec3(0.0, 0.0, 1.0)), 0.0), 2.0);
+        vec3 col = uColor * diff + vec3(0.22, 0.74, 0.97) * rim * 0.55;
+        gl_FragColor = vec4(col, 1.0);
+      }
+    `;
+
+    function compile(type, src) {
+      const sh = gl.createShader(type);
+      gl.shaderSource(sh, src);
+      gl.compileShader(sh);
+      return sh;
+    }
+
+    const prog = gl.createProgram();
+    gl.attachShader(prog, compile(gl.VERTEX_SHADER, vsSource));
+    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fsSource));
+    gl.linkProgram(prog);
+    gl.useProgram(prog);
+
+    // Build procedural torus vertices
+    const segU = 42, segV = 22, R = 1.25, r = 0.42;
+    const positions = [], normals = [], indices = [];
+    for (let i = 0; i <= segU; i++) {
+      const u = (i / segU) * Math.PI * 2;
+      for (let j = 0; j <= segV; j++) {
+        const v = (j / segV) * Math.PI * 2;
+        const cx = (R + r * Math.cos(v)) * Math.cos(u);
+        const cy = r * Math.sin(v);
+        const cz = (R + r * Math.cos(v)) * Math.sin(u);
+        positions.push(cx, cy, cz);
+        normals.push(Math.cos(v) * Math.cos(u), Math.sin(v), Math.cos(v) * Math.sin(u));
+      }
+    }
+    for (let i = 0; i < segU; i++) {
+      for (let j = 0; j < segV; j++) {
+        const a = i * (segV + 1) + j;
+        const b = (i + 1) * (segV + 1) + j;
+        indices.push(a, b, a + 1, b, b + 1, a + 1);
+      }
+    }
+
+    const posBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
+    const aPos = gl.getAttribLocation(prog, 'aPos');
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+
+    const normBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, normBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(normals), gl.STATIC_DRAW);
+    const aNormal = gl.getAttribLocation(prog, 'aNormal');
+    gl.enableVertexAttribArray(aNormal);
+    gl.vertexAttribPointer(aNormal, 3, gl.FLOAT, false, 0, 0);
+
+    const idxBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(indices), gl.STATIC_DRAW);
+
+    const touch = createTouchController(canvas, () => {
+      touch.targetTheta = 0.62;
+      touch.targetPhi = 1.15;
+      touch.targetRadius = 5.4;
+    });
+
+    activeApi = {
+      setCameraView: (viewId) => {
+        if (viewId === 'front') { touch.targetTheta = 0; touch.targetPhi = 1.57; }
+        else if (viewId === 'top') { touch.targetTheta = 0; touch.targetPhi = 0.25; }
+        else { touch.targetTheta = 0.62; touch.targetPhi = 1.15; }
+      },
+      onConfigUpdated: () => {}
+    };
+
+    function hexToRgb(hex) {
+      const v = parseInt(hex.replace('#', ''), 16);
+      return [((v >> 16) & 255) / 255, ((v >> 8) & 255) / 255, (v & 255) / 255];
+    }
+
+    function mulMat4(a, b) {
+      const out = new Float32Array(16);
+      for (let i = 0; i < 4; i++) {
+        for (let j = 0; j < 4; j++) {
+          out[j * 4 + i] = a[i] * b[j * 4] + a[4 + i] * b[j * 4 + 1] + a[8 + i] * b[j * 4 + 2] + a[12 + i] * b[j * 4 + 3];
+        }
+      }
+      return out;
+    }
+
+    notifyReady('WebGL Offline', true);
+
+    let last = performance.now();
+    let frames = 0;
+    let lastTel = performance.now();
+
+    function draw(now) {
+      requestAnimationFrame(draw);
+      const dt = Math.min(0.05, (now - last) * 0.001);
+      last = now;
+      if (currentConfig.autoRotate && !touch.isDragging) {
+        touch.targetTheta += dt * 0.4 * currentConfig.animSpeed;
+      }
+      touch.theta += (touch.targetTheta - touch.theta) * 0.12;
+      touch.phi += (touch.targetPhi - touch.phi) * 0.12;
+      touch.radius += (touch.targetRadius - touch.radius) * 0.12;
+
+      gl.enable(gl.DEPTH_TEST);
+      gl.clearColor(0.027, 0.035, 0.059, 1.0);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+      const aspect = canvas.width / Math.max(1, canvas.height);
+      const fov = 0.8;
+      const f = 1 / Math.tan(fov / 2);
+      const near = 0.1, far = 50.0;
+      const proj = new Float32Array([
+        f / aspect, 0, 0, 0,
+        0, f, 0, 0,
+        0, 0, (far + near) / (near - far), -1,
+        0, 0, (2 * far * near) / (near - far), 0
+      ]);
+
+      const ct = Math.cos(touch.theta), st = Math.sin(touch.theta);
+      const cp = Math.cos(touch.phi - 1.57), sp = Math.sin(touch.phi - 1.57);
+      const rotY = new Float32Array([ct, 0, -st, 0, 0, 1, 0, 0, st, 0, ct, 0, 0, 0, 0, 1]);
+      const rotX = new Float32Array([1, 0, 0, 0, 0, cp, sp, 0, 0, -sp, cp, 0, 0, 0, 0, 1]);
+      const trans = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, -touch.radius, 1]);
+      const model = mulMat4(rotX, rotY);
+      const mvp = mulMat4(proj, mulMat4(trans, model));
+
+      gl.uniformMatrix4fv(gl.getUniformLocation(prog, 'uMvp'), false, mvp);
+      gl.uniformMatrix4fv(gl.getUniformLocation(prog, 'uModel'), false, model);
+      const rgb = hexToRgb(currentConfig.primaryColorHex);
+      gl.uniform3f(gl.getUniformLocation(prog, 'uColor'), rgb[0], rgb[1], rgb[2]);
+
+      const mode = currentConfig.materialMode === 'wireframe' ? gl.LINES : gl.TRIANGLES;
+      gl.drawElements(mode, indices.length, gl.UNSIGNED_SHORT, 0);
+
+      frames++;
+      if (now - lastTel >= 450) {
+        const fps = Math.round((frames * 1000) / (now - lastTel));
+        frames = 0;
+        lastTel = now;
+        notifyTelemetry({
+          fps: fps,
+          triangles: indices.length / 3,
+          vertices: positions.length / 3,
+          azimuthDeg: Math.round(((touch.theta * 180 / Math.PI) % 360 + 360) % 360),
+          elevationDeg: Math.round(90 - touch.phi * 180 / Math.PI),
+          distance: Number(touch.radius.toFixed(1))
+        });
+      }
+    }
+
+    requestAnimationFrame(draw);
+  }
+
+  loadScriptAt(0);
+})();
+</script>
+</body>
+</html>
